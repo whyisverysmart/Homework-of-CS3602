@@ -1,0 +1,5 @@
+output/
+*.slurm
+*/__pycache__/
+model.bin
+data/prediction.json
