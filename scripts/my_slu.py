@@ -1,4 +1,4 @@
-# coding: utf-8
+#coding=utf8
 
 import sys, os, time, gc, json
 from torch.optim import Adam
@@ -11,11 +11,7 @@ from utils.initialization import *
 from utils.example import Example
 from utils.batch import from_example_list
 from utils.vocab import PAD
-from transformers import AutoTokenizer, AutoModelForMaskedLM, BertTokenizer, BertModel
-import torch
-from typing import List, Tuple
-
-import light_hf_proxy
+from model.slu_roberta_tagging import SLURoberta
 
 # initialization params, output path, logger, random seed and torch.device
 args = init_args(sys.argv[1:])
@@ -34,88 +30,26 @@ dev_dataset = Example.load_dataset(dev_path)
 print("Load dataset and database finished, cost %.4fs ..." % (time.time() - start_time))
 print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dataset)))
 
-args.vocab_size = Example.word_vocab.vocab_size # Vocab: Mapping word to index (int), 0 = <pad>, 1 = <unk>
-args.pad_idx = Example.word_vocab[PAD] # index of <pad> in word2idx is 0
-args.num_tags = Example.label_vocab.num_tags 
+args.vocab_size = Example.word_vocab.vocab_size
+args.pad_idx = Example.word_vocab[PAD]
+args.num_tags = Example.label_vocab.num_tags
 args.tag_pad_idx = Example.label_vocab.convert_tag_to_idx(PAD)
 
-
-# hfl/chinese-roberta-wwm-ext
-tokenizer = BertTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
-model = BertModel.from_pretrained(
-    "hfl/chinese-roberta-wwm-ext",
-    output_hidden_states=True
-).to(device)
+model = SLURoberta(args).to(device)
+print("Model initialization finished ...")
 
 if args.testing:
-    check_point = torch.load(open('model_bert.bin', 'rb'), map_location=device)
+    check_point = torch.load(open('model.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
+
 
 def set_optimizer(model, args):
     params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grouped_params = [{'params': list(set([p for n, p in params]))}]
-    optimizer = Adam(grouped_params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = Adam(grouped_params, lr=args.lr)
     return optimizer
 
-def prepare_input(args, cur_dataset: List[Example], tokenizer, device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    input_ids = []
-    tag_ids = []
-    attn_masks = []
-
-    # max_len = args.max_len
-    max_len = max([len(example.utt) for example in cur_dataset])
-
-    for example in cur_dataset:
-        encoded_dict = tokenizer(
-            example.utt,
-            add_special_tokens=True, 
-            max_length=max_len,  
-            padding='max_length',
-            return_attention_mask=True,
-            return_tensors='pt', 
-            truncation=True
-        )
-        input_ids.append(encoded_dict['input_ids'])
-        tags = example.tag_id + [args.tag_pad_idx] * (max_len - len(example.tag_id))
-        tag_ids.append(torch.tensor(tags, dtype=torch.long).unsqueeze(0))
-        attn_masks.append(encoded_dict['attention_mask'])
-
-    input_ids = torch.cat(input_ids, dim=0).to(device)
-    tag_ids = torch.cat(tag_ids, dim=0).to(device)
-    attn_masks = torch.cat(attn_masks, dim=0).to(device)
-
-    return input_ids, tag_ids, attn_masks
-
-def tags_to_triples(preds: List[List], examples: List[Example]):
-    batch_size = len(examples)
-    predictions = []
-    for i in range(batch_size):
-        pred, example = preds[i], examples[i]
-        utt = example.utt
-        pred = pred[:len(utt)]
-        pred_tuple = []
-        idx_buff, tag_buff, pred_tags = [], [], []
-        for idx, tid in enumerate(pred):
-            tag = Example.label_vocab.convert_idx_to_tag(tid)
-            pred_tags.append(tag)
-            if (tag == 'O' or tag.startswith('B')) and len(tag_buff) > 0:
-                slot = '-'.join(tag_buff[0].split('-')[1:])
-                value = ''.join([utt[j] for j in idx_buff])
-                idx_buff, tag_buff = [], []
-                pred_tuple.append(f'{slot}-{value}')
-                if tag.startswith('B'):
-                    idx_buff.append(idx)
-                    tag_buff.append(tag)
-            elif tag.startswith('I') or tag.startswith('B'):
-                idx_buff.append(idx)
-                tag_buff.append(tag)
-        if len(tag_buff) > 0:
-            slot = '-'.join(tag_buff[0].split('-')[1:])
-            value = ''.join([utt[j] for j in idx_buff])
-            pred_tuple.append(f'{slot}-{value}')
-        predictions.append(pred_tuple)
-    return predictions
 
 def decode(choice):
     assert choice in ['train', 'dev']
@@ -126,22 +60,17 @@ def decode(choice):
     with torch.no_grad():
         for i in range(0, len(dataset), args.batch_size):
             cur_dataset = dataset[i: i + args.batch_size]
-            input_ids, tag_ids, attn_masks = prepare_input(args, cur_dataset, tokenizer, device)
-            output = model(input_ids, attention_mask=attn_masks, labels=tag_ids)
-            logits, loss = output.logits, output.loss
-
-            pred = torch.argmax(logits, dim=-1).cpu().tolist()
-            tag_ids = tag_ids.cpu().tolist()
-            pred, label = tags_to_triples(pred, cur_dataset), tags_to_triples(tag_ids, cur_dataset)
+            current_batch = from_example_list(args, cur_dataset, device, train=True)
+            pred, label, loss = model.decode(Example.label_vocab, current_batch)
             predictions.extend(pred)
             labels.extend(label)
-
-            total_loss += loss.item()
+            total_loss += loss
             count += 1
-        metrics = Example.evaluator.acc(predictions, labels)
+        metrics = Example.evaluator.acc(predictions, labels) # here predictions and labels all comoposed of act-slot-value(maybe without slot or slot-value), for comparison
     torch.cuda.empty_cache()
     gc.collect()
     return metrics, total_loss / count
+
 
 def predict():
     model.eval()
@@ -151,28 +80,26 @@ def predict():
     with torch.no_grad():
         for i in range(0, len(test_dataset), args.batch_size):
             cur_dataset = test_dataset[i: i + args.batch_size]
-            input_ids, tag_ids, attn_masks = prepare_input(args, cur_dataset, tokenizer, device)
-
-            logits = model(input_ids, attention_mask=attn_masks).logits
-            pred = torch.argmax(logits, dim=-1).cpu().tolist()
-            pred = tags_to_triples(pred, cur_dataset)
+            current_batch = from_example_list(args, cur_dataset, device, train=False)
+            pred = model.decode(Example.label_vocab, current_batch)
             for pi, p in enumerate(pred):
-                did = cur_dataset[pi].did
+                did = current_batch.did[pi]
                 predictions[did] = p
-    test_json = json.load(open(test_path, 'r', encoding='utf-8'))
+    test_json = json.load(open(test_path, 'r'))
     ptr = 0
     for ei, example in enumerate(test_json):
         for ui, utt in enumerate(example):
             utt['pred'] = [pred.split('-') for pred in predictions[f"{ei}-{ui}"]]
             ptr += 1
-    json.dump(test_json, open(os.path.join(args.dataroot, 'prediction.json'), 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
+    json.dump(test_json, open(os.path.join(args.dataroot, 'prediction.json'), 'w'), indent=4, ensure_ascii=False)
+
 
 if not args.testing:
     num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
     print('Total training steps: %d' % (num_training_steps))
     optimizer = set_optimizer(model, args)
     nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
-    train_index, step_size = np.arange(nsamples), args.batch_size
+    train_index, batch_size = np.arange(nsamples), args.batch_size
     print('Start training ......')
     for i in range(args.max_epoch):
         start_time = time.time()
@@ -180,12 +107,10 @@ if not args.testing:
         np.random.shuffle(train_index)
         model.train()
         count = 0
-        for j in range(0, nsamples, step_size):
-            # cur_dataset: list of Example objects
-            cur_dataset: List["Example"] = [train_dataset[k] for k in train_index[j: j + step_size]]
-            input_ids, tag_ids, attn_masks = prepare_input(args, cur_dataset, tokenizer, device)
-            output = model(input_ids, attention_mask=attn_masks, labels=tag_ids)
-            loss = output.loss
+        for j in range(0, nsamples, batch_size):
+            cur_dataset = [train_dataset[k] for k in train_index[j: j + batch_size]]
+            current_batch = from_example_list(args, cur_dataset, device, train=True)
+            output, loss = model(current_batch)
             epoch_loss += loss.item()
             loss.backward()
             optimizer.step()
@@ -204,7 +129,7 @@ if not args.testing:
             torch.save({
                 'epoch': i, 'model': model.state_dict(),
                 'optim': optimizer.state_dict(),
-            }, open('model_bert.bin', 'wb'))
+            }, open('model.bin', 'wb'))
             print('NEW BEST MODEL: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
 
     print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))

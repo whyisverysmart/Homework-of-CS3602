@@ -26,11 +26,11 @@ class SLURoberta(nn.Module):
         super(SLURoberta, self).__init__()
         self.config = config
         self.cell = config.encoder_cell
-        self.device = config.device
 
         self.tokenizer = BertTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
         self.model = BertModel.from_pretrained("hfl/chinese-roberta-wwm-ext",
-                                               output_hidden_states=True).to(self.device)
+                                               output_hidden_states=True)
+        # RoBERTa hidden size
         self.hidden_size = 768
         self.output_layer = TaggingFNNDecoder(self.hidden_size, config.num_tags, config.tag_pad_idx)
 
@@ -43,7 +43,7 @@ class SLURoberta(nn.Module):
                                         padding="max_length",
                                         truncation=True,
                                         max_length=max(self.length),
-                                        return_tensors='pt').to(self.device)
+                                        return_tensors='pt')
         hidden_states = self.model(**encoded_inputs).hidden_states
         hiddens = hidden_states[-1]
         tag_output = self.output_layer(hiddens, tag_mask, tag_ids)
