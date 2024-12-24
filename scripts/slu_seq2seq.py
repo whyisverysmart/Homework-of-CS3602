@@ -1,4 +1,4 @@
-#coding=utf8
+# coding: utf-8
 
 import sys, os, time, gc, json
 from torch.optim import Adam
@@ -6,12 +6,12 @@ from torch.optim import Adam
 install_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(install_path)
 
-from utils.args_roberta import init_args
+from utils.args_seq2seq import init_args
 from utils.initialization import *
 from utils.example import Example
 from utils.batch import from_example_list
 from utils.vocab import PAD
-from model.slu_roberta_tagging import SLURoberta
+from model.slu_seq2seq_tagging import SLUSeq2Seq
 
 # initialization params, output path, logger, random seed and torch.device
 args = init_args(sys.argv[1:])
@@ -35,7 +35,8 @@ args.pad_idx = Example.word_vocab[PAD]
 args.num_tags = Example.label_vocab.num_tags
 args.tag_pad_idx = Example.label_vocab.convert_tag_to_idx(PAD)
 
-model = SLURoberta(args).to(device)
+model = SLUSeq2Seq(args).to(device)
+Example.word2vec.load_embeddings(model.encoder.embedding, Example.word_vocab, device=device)
 print("Model initialization finished ...")
 
 if args.testing:
