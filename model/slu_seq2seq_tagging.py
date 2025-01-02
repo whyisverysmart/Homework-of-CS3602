@@ -79,7 +79,6 @@ class Decoder(nn.Module):
             attention_output, _ = self.attention(Q, KV, KV, key_padding_mask=mask)
             context_vector = attention_output.transpose(0, 1).squeeze(1) # [batch_size, hidden_size]
 
-            # Scheduled Sampling
             if labels is not None:
                 if random.random() < 0.5:
                     decoder_input = torch.cat((context_vector, labels[:, t].unsqueeze(1).expand(-1, self.hidden_size)), dim=-1)

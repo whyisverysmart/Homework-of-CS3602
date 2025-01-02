@@ -12,6 +12,9 @@ from utils.example import Example
 from utils.batch import from_example_list
 from utils.vocab import PAD
 from model.slu_baseline_tagging import SLUTagging
+from typing import List
+
+from tqdm.auto import tqdm
 
 # initialization params, output path, logger, random seed and torch.device
 args = init_args(sys.argv[1:])
@@ -30,11 +33,16 @@ dev_dataset = Example.load_dataset(dev_path)
 print("Load dataset and database finished, cost %.4fs ..." % (time.time() - start_time))
 print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dataset)))
 
-args.vocab_size = Example.word_vocab.vocab_size
-args.pad_idx = Example.word_vocab[PAD]
-args.num_tags = Example.label_vocab.num_tags
-args.tag_pad_idx = Example.label_vocab.convert_tag_to_idx(PAD)
+args.vocab_size = Example.word_vocab.vocab_size # Vocab: Mapping word to index (int), 0 = <pad>, 1 = <unk>
+args.pad_idx = Example.word_vocab[PAD] # index of <pad> in word2idx is 0
 
+# Tag: <bi> - <act> - <slot>, each tag corresponds to an index
+# <bi>: B (beginning) or I (inside), <act>: inform / deny, <slot>: slot name
+# LabelVocab.convert_tag_to_idx(tag) -> index, LabelVocab.convert_idx_to_tag(index) -> tag
+args.num_tags = Example.label_vocab.num_tags 
+
+# "<pad>" tag index is 0, "O" tag index is 1
+args.tag_pad_idx = Example.label_vocab.convert_tag_to_idx(PAD)
 
 model = SLUTagging(args).to(device)
 Example.word2vec.load_embeddings(model.word_embed, Example.word_vocab, device=device)
@@ -44,13 +52,11 @@ if args.testing:
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 
-
 def set_optimizer(model, args):
     params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grouped_params = [{'params': list(set([p for n, p in params]))}]
     optimizer = Adam(grouped_params, lr=args.lr)
     return optimizer
-
 
 def decode(choice):
     assert choice in ['train', 'dev']
@@ -74,7 +80,6 @@ def decode(choice):
     torch.cuda.empty_cache()
     gc.collect()
     return metrics, total_loss / count
-
 
 def predict():
     model.eval()
@@ -112,7 +117,8 @@ if not args.testing:
         model.train()
         count = 0
         for j in range(0, nsamples, step_size):
-            cur_dataset = [train_dataset[k] for k in train_index[j: j + step_size]]
+            # cur_dataset: list of Example objects
+            cur_dataset: List["Example"] = [train_dataset[k] for k in train_index[j: j + step_size]]
             current_batch = from_example_list(args, cur_dataset, device, train=True)
             output, loss = model(current_batch)
             epoch_loss += loss.item()

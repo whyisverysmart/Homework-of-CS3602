@@ -6,15 +6,16 @@ from torch.optim import Adam, AdamW
 install_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(install_path)
 
-from utils.args_bert import init_args
+from utils.args_transformer import init_args
 from utils.initialization import *
 from utils.example import Example
 from utils.batch import from_example_list
 from utils.vocab import PAD
 from typing import List
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, AutoModelForMaskedLM, BertTokenizer, BertForTokenClassification, BertForMaskedLM, BertConfig
+from transformers import BertTokenizer
 from torch import nn
+from torch.nn import Transformer
 import torch
 from typing import List, Tuple
 
@@ -27,10 +28,8 @@ print("Random seed is set to %d" % (args.seed))
 print("Use GPU with index %s" % (args.device) if args.device >= 0 else "Use CPU as target torch device")
 
 start_time = time.time()
-# train_path = os.path.join(args.dataroot, 'train.json')
-train_path = os.path.join(args.dataroot, 'train_new.json')
+train_path = os.path.join(args.dataroot, 'train.json')
 dev_path = os.path.join(args.dataroot, 'development.json')
-# dev_path = os.path.join(args.dataroot, 'development_new.json')
 Example.configuration(args.dataroot, train_path=train_path, word2vec_path=args.word2vec_path)
 train_dataset = Example.load_dataset(train_path)
 dev_dataset = Example.load_dataset(dev_path)
@@ -43,19 +42,90 @@ args.num_tags = Example.label_vocab.num_tags
 args.tag_pad_idx = Example.label_vocab.convert_tag_to_idx(PAD)
 
 tokenizer = BertTokenizer.from_pretrained(args.bert_path)
-config = BertConfig(
-    vocab_size=args.vocab_size,
-    hidden_size=args.hidden_size,
-    num_hidden_layers=args.num_layer,
-    num_attention_heads=args.num_heads,
-    num_labels=args.num_tags,
-    hidden_act="relu",
-    hidden_dropout_prob=args.dropout,
-)
-model = BertForTokenClassification(config).to(device)
+
+args.vocab_size = tokenizer.vocab_size
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, embed_dim, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        # pe = torch.zeros(max_len, embed_dim)
+        # position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        # div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-torch.log(torch.tensor(10000.0)) / embed_dim))
+        # pe[:, 0::2] = torch.sin(position * div_term)
+        # pe[:, 1::2] = torch.cos(position * div_term)
+        # pe = pe.unsqueeze(0).transpose(0, 1)
+
+        pe = nn.Parameter(torch.randn(max_len, embed_dim))
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return x
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, ff_dim=None, dropout=0.1):
+        super(TransformerBlock, self).__init__()
+        if ff_dim is None:
+            ff_dim = embed_dim * 4
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim),
+            nn.ReLU(),
+            nn.Linear(ff_dim, embed_dim),
+        )
+        self.layer_norm1 = nn.LayerNorm(embed_dim)
+        self.layer_norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Multi-head self-attention
+        attn_output, _ = self.attention(x, x, x)
+        x = x + self.dropout(attn_output)
+        x = self.layer_norm1(x)
+        # Feed-forward network
+        ff_output = self.feed_forward(x)
+        x = x + self.dropout(ff_output)
+        x = self.layer_norm2(x)
+        return x
+
+class TransformerModel(nn.Module):
+    def __init__(self, config):
+        super(TransformerModel, self).__init__()
+        self.embedding = nn.Embedding(config.vocab_size, config.embed_size)
+        # self.positional_encoding = PositionalEncoding(config.embed_size)
+        self.transformer_blocks = nn.ModuleList(
+            [TransformerBlock(config.embed_size, config.num_heads, dropout=config.dropout) for _ in range(config.num_blocks)]
+        )
+        self.linear = nn.Linear(config.embed_size, config.num_tags)
+
+    def forward(self, input_ids, labels=None):
+        x = self.embedding(input_ids)
+        # x = self.positional_encoding(x)
+        x = x.transpose(0, 1)  # Transformer expects input of shape (seq_len, batch_size, embed_dim)
+        for block in self.transformer_blocks:
+            x = block(x)
+        x = x.transpose(0, 1)  # Back to (batch_size, seq_len, embed_dim)
+        logits = self.linear(x)
+        
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            return logits, loss
+        return logits
+
+model = TransformerModel(args).to(device)
+
+# Example.word2vec.load_embeddings(model.embedding, Example.word_vocab, device=device)
 
 if args.testing:
-    check_point = torch.load(open('model_bert.bin', 'rb'), map_location=device)
+    check_point = torch.load(open('model_transformer.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 
@@ -129,8 +199,7 @@ def decode(choice):
             cur_dataset = dataset[i: i + args.batch_size]
 
             input_ids, tag_ids, attn_masks = prepare_input(args, cur_dataset, device)
-            output = model(input_ids, attention_mask=attn_masks, labels=tag_ids)
-            logits, loss = output.logits, output.loss
+            logits, loss = model(input_ids, labels=tag_ids)
 
             pred = torch.argmax(logits, dim=-1).cpu().tolist()
             tag_ids = tag_ids.cpu().tolist()
@@ -155,7 +224,7 @@ def predict():
             cur_dataset = test_dataset[i: i + args.batch_size]
             input_ids, tag_ids, attn_masks = prepare_input(args, cur_dataset, device)
 
-            logits = model(input_ids, attention_mask=attn_masks).logits
+            logits = model(input_ids)
             pred = torch.argmax(logits, dim=-1).cpu().tolist()
             pred = tags_to_triples(pred, cur_dataset)
             for pi, p in enumerate(pred):
@@ -187,8 +256,7 @@ if not args.testing:
             # cur_dataset: list of Example objects
             cur_dataset: List["Example"] = [train_dataset[k] for k in train_index[j: j + step_size]]
             input_ids, tag_ids, attn_masks = prepare_input(args, cur_dataset, device)
-            output = model(input_ids, attention_mask=attn_masks, labels=tag_ids)
-            loss = output.loss
+            logits, loss = model(input_ids, labels=tag_ids)
 
             epoch_loss += loss.item()
             loss.backward()
@@ -209,7 +277,7 @@ if not args.testing:
             torch.save({
                 'epoch': i, 'model': model.state_dict(),
                 'optim': optimizer.state_dict(),
-            }, open('model_bert.bin', 'wb'))
+            }, open('model_transformer.bin', 'wb'))
             print('NEW BEST MODEL: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
 
     print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))

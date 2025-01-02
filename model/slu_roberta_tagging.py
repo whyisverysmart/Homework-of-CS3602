@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 from utils.initialization import set_torch_device
-import light_hf_proxy
 
 class TaggingFNNDecoder(nn.Module):
 
@@ -35,6 +34,8 @@ class SLURoberta(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext",)
         self.model = AutoModel.from_pretrained("hfl/chinese-roberta-wwm-ext",
                                                output_hidden_states=True).to(self.device)
+        self.model.requires_grad_(False)
+        self.model.eval()
         # RoBERTa hidden size
         self.hidden_size = 768
         self.output_layer = TaggingFNNDecoder(self.hidden_size, config.num_tags, config.tag_pad_idx)
