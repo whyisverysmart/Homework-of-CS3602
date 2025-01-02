@@ -1,6 +1,6 @@
 output/
 *.slurm
 */__pycache__/
-model.bin
+*.bin
 data/prediction.json
 word2vec-768.txt

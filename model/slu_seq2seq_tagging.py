@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.rnn as rnn_utils
 
+import random
+
 
 class Encoder(nn.Module):
     def __init__(self, config):
@@ -58,11 +60,11 @@ class Decoder(nn.Module):
         self.num_tags = config.num_tags
         self.hidden_size = config.hidden_size
         self.pad_idx = config.tag_pad_idx
-        self.attention = Attention(self.hidden_size)
-        self.output_layer = nn.Linear(self.hidden_size * 2, self.num_tags)
-        self.hidden_update = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.attention = nn.MultiheadAttention(embed_dim=self.hidden_size, num_heads=16, dropout=config.dropout)
+        self.output_lstm = nn.LSTM(self.hidden_size * 2, self.hidden_size, batch_first=True, bidirectional=False)
+        self.tagging = nn.Linear(self.hidden_size, self.num_tags)
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=self.pad_idx)
-        
+        self.dropout = nn.Dropout(p=config.dropout)
 
     def forward(self, encoder_outputs, mask, labels=None):
         batch_size, seq_len, _ = encoder_outputs.size()
@@ -72,19 +74,32 @@ class Decoder(nn.Module):
         all_probs = []
 
         for t in range(seq_len):
-            context_vector, _ = self.attention(decoder_hidden, encoder_outputs)
+            Q = encoder_outputs.transpose(0, 1)[t].unsqueeze(0)
+            KV = encoder_outputs.transpose(0, 1)
+            attention_output, _ = self.attention(Q, KV, KV, key_padding_mask=mask)
+            context_vector = attention_output.transpose(0, 1).squeeze(1) # [batch_size, hidden_size]
 
-            decoder_input = torch.cat((context_vector, decoder_hidden), dim=-1)
+            # Scheduled Sampling
+            if labels is not None:
+                if random.random() < 0.5:
+                    decoder_input = torch.cat((context_vector, labels[:, t].unsqueeze(1).expand(-1, self.hidden_size)), dim=-1)
+                else:
+                    decoder_input = torch.cat((context_vector, decoder_hidden), dim=-1)
+            else:
+                decoder_input = torch.cat((context_vector, decoder_hidden), dim=-1)
 
-            logits = self.output_layer(decoder_input)
+            lstm_output, _ = self.output_lstm(decoder_input)
+            decoder_output = self.dropout(lstm_output)
+
+            logits = self.tagging(decoder_output)
             logits += (1 - mask[:, t].unsqueeze(-1).repeat(1, self.num_tags)) * -1e32
 
             prob = torch.softmax(logits, dim=-1)
-            
+
             all_logits.append(logits.unsqueeze(1))
             all_probs.append(prob.unsqueeze(1))
 
-            decoder_hidden = torch.tanh(self.hidden_update(decoder_input))
+            decoder_hidden = decoder_output
 
         all_logits = torch.cat(all_logits, dim=1)
         all_probs = torch.cat(all_probs, dim=1)
@@ -92,7 +107,7 @@ class Decoder(nn.Module):
         if labels is not None:
             loss = self.loss_fct(all_logits.view(-1, all_logits.shape[-1]), labels.view(-1))
             return all_probs, loss
-        return all_probs,
+        return (all_probs, )
 
 
 class SLUSeq2Seq(nn.Module):

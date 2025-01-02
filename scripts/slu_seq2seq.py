@@ -2,6 +2,7 @@
 
 import sys, os, time, gc, json
 from torch.optim import Adam
+from torch.optim.lr_scheduler import StepLR
 
 install_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(install_path)
@@ -40,7 +41,7 @@ Example.word2vec.load_embeddings(model.encoder.embedding, Example.word_vocab, de
 print("Model initialization finished ...")
 
 if args.testing:
-    check_point = torch.load(open('model.bin', 'rb'), map_location=device)
+    check_point = torch.load(open('model_seq2seq.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 
@@ -49,7 +50,8 @@ def set_optimizer(model, args):
     params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grouped_params = [{'params': list(set([p for n, p in params]))}]
     optimizer = Adam(grouped_params, lr=args.lr)
-    return optimizer
+    scheduler = StepLR(optimizer, step_size=10, gamma=0.6)
+    return optimizer, scheduler
 
 
 def decode(choice):
@@ -98,7 +100,7 @@ def predict():
 if not args.testing:
     num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
     print('Total training steps: %d' % (num_training_steps))
-    optimizer = set_optimizer(model, args)
+    optimizer, scheduler = set_optimizer(model, args)
     nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
     train_index, batch_size = np.arange(nsamples), args.batch_size
     print('Start training ......')
@@ -117,6 +119,7 @@ if not args.testing:
             optimizer.step()
             optimizer.zero_grad()
             count += 1
+        scheduler.step()
         print('Training: \tEpoch: %d\tTime: %.4f\tTraining Loss: %.4f' % (i, time.time() - start_time, epoch_loss / count))
         torch.cuda.empty_cache()
         gc.collect()
@@ -130,7 +133,7 @@ if not args.testing:
             torch.save({
                 'epoch': i, 'model': model.state_dict(),
                 'optim': optimizer.state_dict(),
-            }, open('model.bin', 'wb'))
+            }, open('model_seq2seq.bin', 'wb'))
             print('NEW BEST MODEL: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
 
     print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
